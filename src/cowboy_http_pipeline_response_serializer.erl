@@ -13,14 +13,26 @@
 		terminate/2,
 		code_change/3
 	]).
--define(start_handler( Req, Handler, HandlerOpts ), {start_handler, Req, Handler, HandlerOpts}).
+-define(start_handler( Req, ReqProps, Handler, HandlerOpts ), {start_handler, Req, ReqProps, Handler, HandlerOpts}).
 -define(response(ReqID, HttpStatus, HttpHeaders, HttpBody), {response, ReqID, HttpStatus, HttpHeaders, HttpBody}).
 
 start_link( ConnPid ) ->
 	gen_server:start_link( ?MODULE, {ConnPid}, [] ).
 
-start_handler( ResponseSerializer, Req, Handler, HandlerOpts ) ->
-	gen_server:call( ResponseSerializer, ?start_handler( Req, Handler, HandlerOpts ) ).
+start_handler( ResponseSerializer, Req0, Handler, HandlerOpts ) ->
+	{Req1, ReqProps} = lists:foldl(
+		fun( F, {ReqIn, ReqPropsIn} ) ->
+			{Field, Value, ReqOut} = F(ReqIn),
+			ReqPropsOut = [ {Field, Value} | ReqPropsIn ],
+			{ReqOut, ReqPropsOut}
+		end,
+		{Req0, []}, [
+				fun req_get_method/1,
+				fun req_get_qs/1,
+				fun req_get_headers/1,
+				fun req_get_body/1
+			]),
+	gen_server:call( ResponseSerializer, ?start_handler( Req1, ReqProps, Handler, HandlerOpts ) ).
 
 response( ResponseSerializer, ReqID, HttpStatus, HttpHeaders, HttpBody ) ->
 	gen_server:call( ResponseSerializer, ?response(ReqID, HttpStatus, HttpHeaders, HttpBody) ).
@@ -52,8 +64,8 @@ init( {ConnPid} ) ->
 			worker_sup = WorkerSup
 		}}.
 
-handle_call( ?start_handler( Req, Handler, HandlerOpts ), GenReplyTo, State ) ->
-	handle_call_start_handler( Req, Handler, HandlerOpts, GenReplyTo, State );
+handle_call( ?start_handler( Req, ReqProps, Handler, HandlerOpts ), GenReplyTo, State ) ->
+	handle_call_start_handler( Req, ReqProps, Handler, HandlerOpts, GenReplyTo, State );
 
 handle_call( ?response( ReqID, HttpStatus, HttpHeaders, HttpBody ), GenReplyTo, State ) ->
 	handle_call_response( ReqID, HttpStatus, HttpHeaders, HttpBody, GenReplyTo, State );
@@ -68,7 +80,7 @@ handle_cast( Unexpected, State ) ->
 	{noreply, State}.
 
 handle_info( {'DOWN', _MonRef, process, ConnPid, _}, State = #s{ conn_pid = ConnPid } ) ->
-	log([?MODULE, handle_info, {conn_down, ConnPid}]),
+	% log([?MODULE, handle_info, {conn_down, ConnPid}]),
 	{stop, {shutdown, conn_down}, State};
 
 handle_info( Unexpected, State ) ->
@@ -86,52 +98,40 @@ handle_call_response( ReqID, HttpStatus, HttpHeaders, HttpBody, _GenReplyTo, Sta
 	{reply, ok, State0 #s{ req_queue = RqQ1, resp_map = RsM1 }}.
 
 handle_call_start_handler(
-	Req0, Handler,
+	Req, ReqProps, Handler,
 	HandlerOpts, _GenReplyTo,
 	State0 = #s{
 		worker_sup = WorkerSup,
 		req_queue = ReqQueue0
 	}
 ) ->
-	{Req1, ReqProps} = lists:foldl(
-		fun( F, {ReqIn, ReqPropsIn} ) ->
-			{Field, Value, ReqOut} = F(ReqIn),
-			ReqPropsOut = [ {Field, Value} | ReqPropsIn ],
-			{ReqOut, ReqPropsOut}
-		end,
-		{Req0, []}, [
-				fun req_get_method/1,
-				fun req_get_qs/1,
-				fun req_get_headers/1,
-				fun req_get_body/1
-			]),
 	{ReqID, State1} = next_req_id( State0 ),
 	{ok, WorkerPid} = start_link_worker( WorkerSup, ReqID, ReqProps, Handler, HandlerOpts ),
 	ReqWorker = #req_worker{
 			req_id = ReqID,
-			req = Req1,
+			req = Req,
 			worker_pid = WorkerPid
 		},
 	ReqQueue1 = queue:in( ReqWorker, ReqQueue0 ),
 	{reply, {ok, ReqWorker}, State1 #s{ req_queue = ReqQueue1 } }.
 
 maybe_flush_responses( RqQ0, RsM0 ) ->
-	log([?MODULE, maybe_flush_responses,
-		{rqq, [ ID || #req_worker{ req_id = ID } <- queue:to_list( RqQ0 ) ]},
-		{rsm, [ ID || {ID, #response{}} <- lists:sort(orddict:to_list( RsM0 )) ]}]),
+	% log([?MODULE, maybe_flush_responses,
+	% 	{rqq, [ ID || #req_worker{ req_id = ID } <- queue:to_list( RqQ0 ) ]},
+	% 	{rsm, [ ID || {ID, #response{}} <- lists:sort(orddict:to_list( RsM0 )) ]}]),
 	case queue:peek( RqQ0 ) of
 		empty ->
-			log([?MODULE, maybe_flush_responses, {rq_q, empty}]),
+			% log([?MODULE, maybe_flush_responses, {rq_q, empty}]),
 			0 = orddict:size( RsM0 ),
 			{RqQ0, RsM0};
 		{value, #req_worker{ req_id = ReqID, req = CowboyReq }} ->
-			log([?MODULE, maybe_flush_responses, {rq_q_peek_id, ReqID}]),
+			% log([?MODULE, maybe_flush_responses, {rq_q_peek_id, ReqID}]),
 			case orddict:find( ReqID, RsM0 ) of
 				error ->
-					log([?MODULE, maybe_flush_responses, {no_rs_match, ReqID}]),
+					% log([?MODULE, maybe_flush_responses, {no_rs_match, ReqID}]),
 					{RqQ0, RsM0};
 				{ok, ResponseMatched} ->
-					log([?MODULE, maybe_flush_responses, {rs_matched, ReqID}]),
+					% log([?MODULE, maybe_flush_responses, {rs_matched, ReqID}]),
 					RqQ1 = queue:drop( RqQ0 ),
 					RsM1 = orddict:erase( ReqID, RsM0 ),
 					ok = flush_single_response( CowboyReq, ResponseMatched ),
@@ -167,5 +167,5 @@ next_req_id( State = #s{ next_req_id = ReqID } ) ->
 start_link_worker( WorkerSup, ReqID, ReqProps, Handler, HandlerOpts ) ->
 	{ok, _} = supervisor:start_child( WorkerSup, [ ReqID, ReqProps, Handler, HandlerOpts ] ).
 
-log(Report) ->
-	ok = error_logger:info_report( Report ).
+% log(Report) ->
+% 	ok = error_logger:info_report( Report ).
