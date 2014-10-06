@@ -1,0 +1,8 @@
+{application,
+	cowboy_http_pipeline, [
+		{description, ""},
+		{vsn, "0.1.0"},
+		{registered, []},
+		{applications, [ cowboy ]},
+		{env, []}
+	]}.
