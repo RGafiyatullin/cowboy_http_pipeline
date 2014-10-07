@@ -13,6 +13,7 @@
 		terminate/2,
 		code_change/3
 	]).
+-define(max_pipeline_len, 5).
 -define(start_handler( Req, ReqProps, Handler, HandlerOpts ), {start_handler, Req, ReqProps, Handler, HandlerOpts}).
 -define(response(ReqID, HttpStatus, HttpHeaders, HttpBody), {response, ReqID, HttpStatus, HttpHeaders, HttpBody}).
 
@@ -47,12 +48,21 @@ response( ResponseSerializer, ReqID, HttpStatus, HttpHeaders, HttpBody ) ->
 		headers :: cowboy:http_headers(),
 		body :: iodata()
 	}).
+-record(pending_request, {
+		req :: cowboy_req:req(),
+		req_props :: [{atom(), term()}],
+		handler :: atom(),
+		handler_opts :: term(),
+		gen_reply_to :: {pid(), reference()}
+	}).
 -record(s, {
 		conn_pid :: pid(),
 		worker_sup :: pid(),
 		req_queue = queue:new() :: queue:queue( #req_worker{} ),
 		resp_map = orddict:new() :: orddict:orddict( #response{} ),
-		next_req_id = 0 :: non_neg_integer()
+		next_req_id = 0 :: non_neg_integer(),
+		max_pipeline_len = ?max_pipeline_len :: pos_integer(),
+		pending_request = undefined :: #pending_request{} | undefined
 	}).
 init( {ConnPid} ) ->
 	ResponseSerializer = self(),
@@ -95,11 +105,40 @@ code_change( _OldVsn, State, _Extra ) -> {ok, State}.
 handle_call_response( ReqID, HttpStatus, HttpHeaders, HttpBody, _GenReplyTo, State0 = #s{ req_queue = RqQ0, resp_map = RsM0 } ) ->
 	Response = #response{ code = HttpStatus, headers = HttpHeaders, body = HttpBody },
 	{RqQ1, RsM1} = maybe_flush_responses( RqQ0, orddict:store( ReqID, Response, RsM0 ) ),
-	{reply, ok, State0 #s{ req_queue = RqQ1, resp_map = RsM1 }}.
+	State1 = State0 #s{ req_queue = RqQ1, resp_map = RsM1 },
+	State2 = maybe_start_pending_request( State1 ),
+	{reply, ok, State2}.
 
 handle_call_start_handler(
 	Req, ReqProps, Handler,
-	HandlerOpts, _GenReplyTo,
+	HandlerOpts, GenReplyTo,
+	State0 = #s{
+		pending_request = undefined
+	}
+) ->
+	case max_pipeline_len_reached( State0 ) of
+		false ->
+			{ok, WorkerPid, State1} = do_start_handler( Req, ReqProps, Handler, HandlerOpts, State0 ),
+			{reply, {ok, WorkerPid}, State1};
+		true ->
+			State1 = do_pend_request( Req, ReqProps, Handler, HandlerOpts, GenReplyTo, State0 ),
+			{noreply, State1}
+	end.
+
+max_pipeline_len_reached( #s{ req_queue = RqQ, max_pipeline_len = MPL } ) ->
+	queue:len( RqQ ) >= MPL.
+
+do_pend_request( Req, ReqProps, Handler, HandlerOpts, GenReplyTo, State0 = #s{ pending_request = undefined } ) ->
+	PendingRequest = #pending_request{
+			req = Req, req_props = ReqProps,
+			handler = Handler, handler_opts = HandlerOpts,
+			gen_reply_to = GenReplyTo
+		},
+	State0 #s{ pending_request = PendingRequest }.
+
+do_start_handler(
+	Req, ReqProps, Handler,
+	HandlerOpts,
 	State0 = #s{
 		worker_sup = WorkerSup,
 		req_queue = ReqQueue0
@@ -113,7 +152,33 @@ handle_call_start_handler(
 			worker_pid = WorkerPid
 		},
 	ReqQueue1 = queue:in( ReqWorker, ReqQueue0 ),
-	{reply, {ok, ReqWorker}, State1 #s{ req_queue = ReqQueue1 } }.
+	State2 = State1 #s{ req_queue = ReqQueue1 },
+	{ok, WorkerPid, State2}.
+
+maybe_start_pending_request( State = #s{ pending_request = undefined } ) -> State;
+maybe_start_pending_request( State = #s{ pending_request = #pending_request{} } ) ->
+	case max_pipeline_len_reached( State ) of
+		true -> State;
+		false ->
+			do_start_pending_request( State )
+	end.
+
+do_start_pending_request(
+	State0 = #s{ pending_request =
+		#pending_request{
+			req = Req, req_props = ReqProps,
+			handler = Handler, handler_opts = HandlerOpts,
+			gen_reply_to = GenReplyTo
+		}
+	}
+) ->
+	State1 = State0 #s{ pending_request = undefined },
+	{ok, WorkerPid, State2} = do_start_handler( Req, ReqProps, Handler, HandlerOpts, State1 ),
+	ReplyWith = {ok, WorkerPid},
+	_Ignored = gen_server:reply( GenReplyTo, ReplyWith ),
+	State2.
+
+
 
 maybe_flush_responses( RqQ0, RsM0 ) ->
 	% log([?MODULE, maybe_flush_responses,
