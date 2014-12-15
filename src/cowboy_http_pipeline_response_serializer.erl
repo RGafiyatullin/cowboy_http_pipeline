@@ -31,7 +31,9 @@ start_handler( ResponseSerializer, Req0, Handler, HandlerOpts ) ->
 				fun req_get_method/1,
 				fun req_get_qs/1,
 				fun req_get_headers/1,
-				fun req_get_body/1
+				fun req_get_body/1,
+				fun req_get_bindings/1,
+				fun req_get_path_info/1
 			]),
 	gen_server:call( ResponseSerializer, ?start_handler( Req1, ReqProps, Handler, HandlerOpts ) ).
 
@@ -79,7 +81,7 @@ handle_call( ?start_handler( Req, ReqProps, Handler, HandlerOpts ), GenReplyTo, 
 
 handle_call( ?response( ReqID, HttpStatus, HttpHeaders, HttpBody ), GenReplyTo, State ) ->
 	handle_call_response( ReqID, HttpStatus, HttpHeaders, HttpBody, GenReplyTo, State );
-	
+
 handle_call( Unexpected, GenReplyTo, State ) ->
 	error_logger:warning_report([ ?MODULE, handle_call,
 		{unexpected, Unexpected}, {gen_reply_to, GenReplyTo} ]),
@@ -224,6 +226,14 @@ req_get_headers( R0 ) ->
 req_get_body( R0 ) ->
 	{ ok, Body, R1 } = cowboy_req:body( R0 ),
 	{ body, Body, R1 }.
+
+req_get_bindings( R0 ) ->
+	{ Bindings, R1 } = cowboy_req:bindings( R0 ),
+	{ bindings, Bindings, R1 }.
+
+req_get_path_info( R0 ) ->
+	{ PathInfo, R1 } = cowboy_req:path_info( R0 ),
+	{ path_info, PathInfo, R1 }.
 
 next_req_id( State = #s{ next_req_id = ReqID } ) ->
 	{ ReqID, State #s{ next_req_id = ReqID + 1 } }.
