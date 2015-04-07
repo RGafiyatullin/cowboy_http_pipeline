@@ -6,6 +6,10 @@
 		response/5
 	]).
 -export ([
+		tx_enter_loop/0,
+		tx_loop/0
+	]).
+-export ([
 		init/1,
 		handle_call/3,
 		handle_cast/2,
@@ -19,6 +23,24 @@
 
 start_link( ConnPid ) ->
 	gen_server:start_link( ?MODULE, {ConnPid}, [] ).
+
+start_link_tx() ->
+	proc_lib:start_link( ?MODULE, tx_enter_loop, [] ).
+
+tx_enter_loop() ->
+	proc_lib:init_ack( {ok, self()} ),
+	tx_loop().
+
+tx_loop() ->
+	receive
+		{reply, CowboyReq, Response} ->
+			ok = flush_single_response( CowboyReq, Response ),
+			tx_loop();
+		Rubbish ->
+			error_logger:error_report( [ ?MODULE, tx_loop, {received_rubbish, Rubbish} ] ),
+			tx_loop()
+	end.
+
 
 start_handler( ResponseSerializer, Req0, Handler, HandlerOpts ) ->
 	{Req1, ReqProps} = lists:foldl(
@@ -59,6 +81,7 @@ response( ResponseSerializer, ReqID, HttpStatus, HttpHeaders, HttpBody ) ->
 	}).
 -record(s, {
 		conn_pid :: pid(),
+		tx_pid :: pid(),
 		worker_sup :: pid(),
 		req_queue = queue:new() :: queue:queue( #req_worker{} ),
 		resp_map = orddict:new() :: orddict:orddict( #response{} ),
@@ -68,11 +91,13 @@ response( ResponseSerializer, ReqID, HttpStatus, HttpHeaders, HttpBody ) ->
 	}).
 init( {ConnPid} ) ->
 	ResponseSerializer = self(),
+	{ok, TxPid} = start_link_tx(),
 	_ConnMonRef = erlang:monitor( process, ConnPid ),
 	{ok, WorkerSup} = simplest_one_for_one:start_link(
 		{ cowboy_http_pipeline_worker, start_link, [ ResponseSerializer ] } ),
 	{ok, #s{
 			conn_pid = ConnPid,
+			tx_pid = TxPid,
 			worker_sup = WorkerSup
 		}}.
 
@@ -104,9 +129,9 @@ code_change( _OldVsn, State, _Extra ) -> {ok, State}.
 
 
 
-handle_call_response( ReqID, HttpStatus, HttpHeaders, HttpBody, _GenReplyTo, State0 = #s{ req_queue = RqQ0, resp_map = RsM0 } ) ->
+handle_call_response( ReqID, HttpStatus, HttpHeaders, HttpBody, _GenReplyTo, State0 = #s{ tx_pid = TxPid, req_queue = RqQ0, resp_map = RsM0 } ) ->
 	Response = #response{ code = HttpStatus, headers = HttpHeaders, body = HttpBody },
-	{RqQ1, RsM1} = maybe_flush_responses( RqQ0, orddict:store( ReqID, Response, RsM0 ) ),
+	{RqQ1, RsM1} = maybe_flush_responses( TxPid, RqQ0, orddict:store( ReqID, Response, RsM0 ) ),
 	State1 = State0 #s{ req_queue = RqQ1, resp_map = RsM1 },
 	State2 = maybe_start_pending_request( State1 ),
 	{reply, ok, State2}.
@@ -182,7 +207,7 @@ do_start_pending_request(
 
 
 
-maybe_flush_responses( RqQ0, RsM0 ) ->
+maybe_flush_responses( TxPid, RqQ0, RsM0 ) ->
 	% log([?MODULE, maybe_flush_responses,
 	% 	{rqq, [ ID || #req_worker{ req_id = ID } <- queue:to_list( RqQ0 ) ]},
 	% 	{rsm, [ ID || {ID, #response{}} <- lists:sort(orddict:to_list( RsM0 )) ]}]),
@@ -201,11 +226,16 @@ maybe_flush_responses( RqQ0, RsM0 ) ->
 					% log([?MODULE, maybe_flush_responses, {rs_matched, ReqID}]),
 					RqQ1 = queue:drop( RqQ0 ),
 					RsM1 = orddict:erase( ReqID, RsM0 ),
-					ok = flush_single_response( CowboyReq, ResponseMatched ),
+					ok = cast_flush_single_response( TxPid, CowboyReq, ResponseMatched ),
 
-					maybe_flush_responses( RqQ1, RsM1 )
+					maybe_flush_responses( TxPid, RqQ1, RsM1 )
 			end
 	end.
+
+cast_flush_single_response( TxPid, CowboyReq, Response ) ->
+	TxPid ! {reply, CowboyReq, Response},
+	ok.
+
 
 flush_single_response( CowboyReq, #response{ code = HttpStatus, headers = HttpHeaders, body = HttpBody } ) ->
 	{ok, _} = cowboy_req:reply( HttpStatus, HttpHeaders, HttpBody, CowboyReq ),
