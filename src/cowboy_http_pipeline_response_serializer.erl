@@ -254,8 +254,12 @@ req_get_headers( R0 ) ->
 	{ headers, Headers, R1 }.
 
 req_get_body( R0 ) ->
-	{ ok, Body, R1 } = cowboy_req:body( R0 ),
-	{ body, Body, R1 }.
+	case cowboy_req:body( R0 ) of
+		{ ok, Body, R1 } -> { body, Body, R1 };
+		{ error, Error } ->
+			ok = error_logger:info_report([?MODULE, req_get_body, {error, Error}]),
+			exit({shutdown, {req_get_body_error, Error}})
+	end.
 
 req_get_bindings( R0 ) ->
 	{ Bindings, R1 } = cowboy_req:bindings( R0 ),
