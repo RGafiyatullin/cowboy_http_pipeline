@@ -10,6 +10,9 @@
 		tx_loop/0
 	]).
 -export ([
+		wait_for_children_enter_loop/2
+	]).
+-export ([
 		init/1,
 		handle_call/3,
 		handle_cast/2,
@@ -18,6 +21,7 @@
 		code_change/3
 	]).
 -define(max_pipeline_len, 5).
+-define(wait_for_children_timeout, 10000).
 -define(start_handler( Req, ReqProps, Handler, HandlerOpts ), {start_handler, Req, ReqProps, Handler, HandlerOpts}).
 -define(response(ReqID, HttpStatus, HttpHeaders, HttpBody), {response, ReqID, HttpStatus, HttpHeaders, HttpBody}).
 
@@ -39,6 +43,32 @@ tx_loop() ->
 		Rubbish ->
 			error_logger:error_report( [ ?MODULE, tx_loop, {received_rubbish, Rubbish} ] ),
 			tx_loop()
+	end.
+
+wait_for_children_enter_loop( WSup, Timeout ) ->
+	ok = proc_lib:init_ack( {ok, self()} ),
+	_Tref = erlang:send_after( Timeout, self(), timeout ),
+	ChildrenAlive = [ Pid
+		|| {_ID, Pid, _Type, _Modules}
+		<- supervisor:which_children( WSup ), is_pid( Pid ) ],
+	ChildrenAliveSet = lists:foldl(
+		fun( Ch, Acc ) ->
+			_MonRef = erlang:monitor( process, Ch ),
+			sets:add_element( Ch, Acc )
+		end,
+		sets:new(), ChildrenAlive ),
+	wait_for_children_loop( ChildrenAliveSet ).
+
+wait_for_children_loop( ChildrenAliveSet ) ->
+	case sets:size( ChildrenAliveSet ) of
+		0 -> erlang:exit({shutdown, waited_for_all_children});
+		Some ->
+			receive
+				timeout ->
+					erlang:exit({shutdown, {timed_out_waiting_for_children, Some}});
+				{'DOWN', _MonRef, process, Pid, _Reason} ->
+					wait_for_children_loop( sets:del_element( Pid, ChildrenAliveSet ) )
+			end
 	end.
 
 
@@ -116,9 +146,11 @@ handle_cast( Unexpected, State ) ->
 	error_logger:warning_report([ ?MODULE, handle_cast, {unexpected, Unexpected} ]),
 	{noreply, State}.
 
-handle_info( {'DOWN', _MonRef, process, ConnPid, _}, State = #s{ conn_pid = ConnPid } ) ->
+handle_info( {'DOWN', _MonRef, process, ConnPid, _}, State = #s{ worker_sup = WSup, conn_pid = ConnPid } ) ->
 	% log([?MODULE, handle_info, {conn_down, ConnPid}]),
-	{stop, {shutdown, conn_down}, State};
+	% {stop, {shutdown, conn_down}, State};
+	{ok, _WaitForChildren} = proc_lib:start_link( ?MODULE, wait_for_children_enter_loop, [ WSup, ?wait_for_children_timeout ] ),
+	{noreply, State};
 
 handle_info( Unexpected, State ) ->
 	error_logger:warning_report([ ?MODULE, handle_info, {unexpected, Unexpected} ]),
